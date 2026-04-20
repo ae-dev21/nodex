@@ -6,10 +6,12 @@ import { NodexMiniBar } from "./shell/NodexMiniBar";
 import { NodexModeLineHost } from "./shell/NodexModeLineHost";
 import { NodexReplOverlay } from "./shell/NodexReplOverlay";
 import { useNodexShell } from "./shell/useNodexShell";
+import { useNotificationsPolling } from "./shell/useNotificationsPolling";
 import { useShellLayoutState } from "./shell/layout/ShellLayoutContext";
 import { useRegisterShellCoreBlocks } from "./shell/first-party/registerShellCoreBlocks";
 import { useRegisterShellDefaultKeybindings } from "./shell/first-party/registerShellDefaultKeybindings";
 import { useRegisterAdminPlugin } from "./shell/first-party/plugins/admin/useRegisterAdminPlugin";
+import { useRegisterNotificationsPlugin } from "./shell/first-party/plugins/notifications/useRegisterNotificationsPlugin";
 import { useRegisterDocumentationPlugin } from "./shell/first-party/plugins/documentation/useRegisterDocumentationPlugin";
 import { useRegisterNotesExplorerPlugin } from "./shell/first-party/plugins/notes-explorer/useRegisterNotesExplorerPlugin";
 import { useRegisterJsNoteEditor } from "./shell/first-party/plugins/js-notebook/useRegisterJsNoteEditor";
@@ -86,6 +88,8 @@ const App: React.FC = () => {
   useRegisterNotesShellPlugin();
   useRegisterNotesExplorerPlugin();
   useRegisterAdminPlugin();
+  useRegisterNotificationsPlugin();
+  useNotificationsPolling();
 
   const inviteToken = readInviteTokenFromUrl();
 

@@ -17,6 +17,11 @@ import {
   readCloudSyncSince,
   writeCloudSyncSince,
 } from "../cloud-sync/cloud-sync-storage";
+import {
+  readNotificationsCursor,
+  writeNotificationsCursor,
+} from "../cloud-sync/notifications-cursor";
+import { fetchNotificationsThunk } from "./notificationsSlice";
 import type { CloudNoteDoc } from "./cloudNotesTypes";
 import { isCloudNoteDoc } from "./cloudNotesTypes";
 import {
@@ -298,6 +303,21 @@ export const runCloudSyncThunk = createAsyncThunk<
     const rows = await rxdbFindAllCloudNotes();
     dispatch(cloudNotesSlice.actions.hydrateFromRxDb({ rows }));
     dispatch(cloudNotesSlice.actions.syncMeta({ status: "idle", error: null }));
+
+    // Phase 8: piggyback notifications fetch on each sync tick. Failure here
+    // doesn't affect notes sync status.
+    try {
+      const since = readNotificationsCursor() ?? undefined;
+      const res = await dispatch(fetchNotificationsThunk(since ? { since } : undefined));
+      if (
+        fetchNotificationsThunk.fulfilled.match(res) &&
+        res.payload.cursor
+      ) {
+        writeNotificationsCursor(res.payload.cursor);
+      }
+    } catch {
+      /* non-fatal */
+    }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     dispatch(cloudNotesSlice.actions.syncMeta({ status: "error", error: msg }));

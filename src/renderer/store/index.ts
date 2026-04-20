@@ -13,6 +13,7 @@ import cloudAuthReducer, { cloudLogoutThunk } from "./cloudAuthSlice";
 import cloudNotesReducer from "./cloudNotesSlice";
 import { cloudNotesRxListener } from "./cloudNotesRxListener";
 import notesReducer from "./notesSlice";
+import notificationsReducer from "./notificationsSlice";
 import orgMembershipReducer from "./orgMembershipSlice";
 import pluginUiReducer from "./pluginUiSlice";
 import spaceMembershipReducer from "./spaceMembershipSlice";
@@ -42,6 +43,7 @@ export const store = configureStore({
     pluginUi: pluginUiReducer,
     cloudNotes: cloudNotesReducer,
     cloudAuth: cloudAuthReducer,
+    notifications: notificationsReducer,
     orgMembership: orgMembershipReducer,
     spaceMembership: spaceMembershipReducer,
   },

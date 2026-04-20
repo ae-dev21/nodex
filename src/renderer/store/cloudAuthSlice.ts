@@ -17,6 +17,7 @@ import {
   resetCloudNotes,
   runCloudSyncThunk,
 } from "./cloudNotesSlice";
+import { fetchNotificationsThunk } from "./notificationsSlice";
 import { clearOrgMembership, setLocalActiveOrg } from "./orgMembershipSlice";
 import { clearSpaceMembership, setLocalActiveSpace } from "./spaceMembershipSlice";
 import { showGlobalToast } from "../toast/toast-service";
@@ -282,6 +283,7 @@ export const cloudLoginThunk = createAsyncThunk<
   } catch {
     /* non-fatal */
   }
+  void dispatch(fetchNotificationsThunk());
   return {
     userId,
     email: email.toLowerCase(),
@@ -312,6 +314,7 @@ export const cloudRegisterThunk = createAsyncThunk<
   if (claims?.activeSpaceId) {
     dispatch(setLocalActiveSpace({ spaceId: claims.activeSpaceId }));
   }
+  void dispatch(fetchNotificationsThunk());
   return { userId, email: email.toLowerCase() };
 });
 

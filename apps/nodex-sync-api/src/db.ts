@@ -22,6 +22,7 @@ import type {
   WorkspaceShareDoc,
   WorkspaceVisibility,
 } from "./org-schemas.js";
+import type { NotificationDoc } from "./notification-schemas.js";
 
 export type SyncNoteDoc = {
   id: string;
@@ -203,6 +204,14 @@ async function ensureIndexes(database: Db): Promise<void> {
 
   const prefs = database.collection<UserPrefsDoc>("user_prefs");
   await prefs.createIndex({ userId: 1 }, { unique: true });
+
+  const notifications = database.collection<NotificationDoc>("notifications");
+  await notifications.createIndex({ userId: 1, createdAt: -1 });
+  await notifications.createIndex({ userId: 1, status: 1, createdAt: -1 });
+  await notifications.createIndex(
+    { dedupeKey: 1 },
+    { unique: true, partialFilterExpression: { dedupeKey: { $exists: true } } },
+  );
 
   const mcpDev = database.collection<McpDeviceSessionDoc>("mcp_device_sessions");
   await mcpDev.createIndex({ userCode: 1 }, { unique: true });
@@ -592,6 +601,12 @@ export type UserDoc = {
   lastActiveOrgId?: string | null;
   /** Most-recently-selected space (scoped to `lastActiveOrgId`); cleared when org changes. */
   lastActiveSpaceId?: string | null;
+  /**
+   * Per-org memory of the last space the user visited in each org. On `POST /orgs/active`
+   * we prefer this over the org's default space so "switch away and come back" lands the
+   * user where they left off. Keyed by orgId → spaceId.
+   */
+  lastActiveSpaceByOrg?: Record<string, string> | null;
   /** When set, the user was admin-created or admin-invited into this org and may not create new orgs. */
   lockedOrgId?: string | null;
   /**
@@ -660,6 +675,13 @@ export function getMcpDeviceSessionsCollection(): Collection<McpDeviceSessionDoc
   return db.collection<McpDeviceSessionDoc>("mcp_device_sessions");
 }
 
+export function getNotificationsCollection(): Collection<NotificationDoc> {
+  if (!db) {
+    throw new Error("MongoDB not connected");
+  }
+  return db.collection<NotificationDoc>("notifications");
+}
+
 export function getOrgsCollection(): Collection<OrgDoc> {
   if (!db) {
     throw new Error("MongoDB not connected");
@@ -686,6 +708,24 @@ export function getSpacesCollection(): Collection<SpaceDoc> {
     throw new Error("MongoDB not connected");
   }
   return db.collection<SpaceDoc>("spaces");
+}
+
+/**
+ * Read-only counterpart to `ensureDefaultSpaceForOrg`: returns the default
+ * space id for an org, or `null` if none exists. Unlike `ensureDefaultSpaceForOrg`,
+ * this does NOT create the space or enrol the caller as Space Owner — it is
+ * safe to call for arbitrary org members looking up their active-org context
+ * (org switch, invite accept, scope-resolution safety nets).
+ */
+export async function getDefaultSpaceIdForOrg(
+  orgIdHex: string,
+): Promise<string | null> {
+  if (!/^[a-f0-9]{24}$/i.test(orgIdHex)) {
+    return null;
+  }
+  const spaces = getSpacesCollection();
+  const doc = await spaces.findOne({ orgId: orgIdHex, kind: "default" });
+  return doc ? doc._id.toHexString() : null;
 }
 
 export function getSpaceMembershipsCollection(): Collection<SpaceMembershipDoc> {

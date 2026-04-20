@@ -1,7 +1,6 @@
 import React from "react";
 import { useSelector } from "react-redux";
 import {
-  createOrgMember,
   listOrgMembers,
   removeOrgMember,
   resetOrgMemberPassword,
@@ -10,6 +9,8 @@ import {
 } from "../auth/auth-client";
 import type { OrgRole } from "../auth/auth-session";
 import type { RootState } from "../store";
+import { InviteDialog } from "./InviteDialog";
+import { PendingInvitesList } from "./PendingInvitesList";
 
 const card = "rounded-md border border-border bg-background p-4 text-sm";
 const heading = "mb-3 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground";
@@ -36,11 +37,6 @@ function generateTempPassword(): string {
   return hex.slice(0, 16);
 }
 
-type CreatedCredential = {
-  email: string;
-  password: string;
-};
-
 type ResetCredential = {
   userId: string;
   email: string;
@@ -54,12 +50,9 @@ export function PeoplePanel(): React.ReactElement | null {
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
-  // Create-member form
-  const [newEmail, setNewEmail] = React.useState("");
-  const [newPassword, setNewPassword] = React.useState(() => generateTempPassword());
-  const [newRole, setNewRole] = React.useState<OrgRole>("member");
-  const [submitting, setSubmitting] = React.useState(false);
-  const [createdCred, setCreatedCred] = React.useState<CreatedCredential | null>(null);
+  // Invite dialog + pending invites refresh trigger
+  const [showInvite, setShowInvite] = React.useState(false);
+  const [invitesRefreshKey, setInvitesRefreshKey] = React.useState(0);
 
   // Per-member reset-password dialog
   const [resetForUserId, setResetForUserId] = React.useState<string | null>(null);
@@ -99,32 +92,6 @@ export function PeoplePanel(): React.ReactElement | null {
         <p className={muted}>Admin access required to manage people.</p>
       </div>
     );
-  }
-
-  async function handleCreate(e: React.FormEvent): Promise<void> {
-    e.preventDefault();
-    if (!orgId) return;
-    const email = newEmail.trim().toLowerCase();
-    if (!email || newPassword.length < 8) return;
-    setSubmitting(true);
-    setError(null);
-    try {
-      await createOrgMember({
-        orgId,
-        email,
-        password: newPassword,
-        role: newRole,
-      });
-      setCreatedCred({ email, password: newPassword });
-      setNewEmail("");
-      setNewPassword(generateTempPassword());
-      setNewRole("member");
-      await refresh();
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setSubmitting(false);
-    }
   }
 
   async function handleRoleChange(userId: string, role: OrgRole): Promise<void> {
@@ -249,87 +216,31 @@ export function PeoplePanel(): React.ReactElement | null {
         ))}
       </section>
 
-      <section className={card} aria-labelledby="people-create">
-        <h2 id="people-create" className={heading}>
-          Add member
-        </h2>
-        <p className="mb-3 text-[11px] text-muted-foreground">
-          Create a member with a temporary password. They will be required to set a new password
-          on first login. Share the password with them privately — it is displayed only once.
-        </p>
-        <form className="space-y-2" onSubmit={handleCreate}>
-          <input
-            type="email"
-            required
-            placeholder="email@company.com"
-            value={newEmail}
-            onChange={(e) => setNewEmail(e.target.value)}
-            className={`${input} w-full`}
-          />
-          <div className="flex items-center gap-2">
-            <input
-              type="text"
-              required
-              minLength={8}
-              placeholder="Temporary password (min 8 chars)"
-              value={newPassword}
-              onChange={(e) => setNewPassword(e.target.value)}
-              className={`${input} w-full font-mono`}
+      <section className={card} aria-labelledby="people-invite">
+        <div className="flex items-center justify-between">
+          <h2 id="people-invite" className={heading}>
+            Invite members
+          </h2>
+          {!showInvite ? (
+            <button type="button" className={btn} onClick={() => setShowInvite(true)}>
+              + Invite member
+            </button>
+          ) : null}
+        </div>
+        {showInvite ? (
+          <div className="mt-2">
+            <InviteDialog
+              orgId={orgId}
+              onClose={() => setShowInvite(false)}
+              onInvited={() => {
+                setInvitesRefreshKey((k) => k + 1);
+              }}
             />
-            <button
-              type="button"
-              className={btn}
-              onClick={() => setNewPassword(generateTempPassword())}
-              title="Generate a new random temporary password"
-            >
-              Generate
-            </button>
-          </div>
-          <div className="flex items-center gap-2">
-            <select
-              aria-label="Role"
-              value={newRole}
-              onChange={(e) => setNewRole(e.target.value as OrgRole)}
-              className={btn}
-            >
-              <option value="member">member</option>
-              <option value="admin">admin</option>
-            </select>
-            <button type="submit" disabled={submitting} className={btn}>
-              {submitting ? "Creating…" : "Create member"}
-            </button>
-          </div>
-        </form>
-        {createdCred ? (
-          <div className="mt-3 rounded-md border border-emerald-500/30 bg-emerald-500/10 p-2 text-[11px]">
-            <p className="mb-1 font-medium text-emerald-800 dark:text-emerald-100">
-              Member created — copy the temporary password now:
-            </p>
-            <div className="mb-1 flex items-center gap-2">
-              <span className="text-muted-foreground">Email:</span>
-              <code className="flex-1 truncate">{createdCred.email}</code>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-muted-foreground">Password:</span>
-              <code className="flex-1 truncate font-mono">{createdCred.password}</code>
-              <button
-                type="button"
-                className={btn}
-                onClick={() => void copy(createdCred.password)}
-              >
-                Copy
-              </button>
-              <button
-                type="button"
-                className={btn}
-                onClick={() => setCreatedCred(null)}
-                title="Dismiss — the password will no longer be shown"
-              >
-                Dismiss
-              </button>
-            </div>
           </div>
         ) : null}
+        <div className="mt-3">
+          <PendingInvitesList orgId={orgId} refreshKey={invitesRefreshKey} />
+        </div>
 
         {resetForUserId ? (
           <div className="mt-3 rounded-md border border-border bg-muted/20 p-2 text-[11px]">

@@ -8,6 +8,8 @@ import {
   ensureUserHasDefaultOrg,
   getActiveDb,
   getAuditEventsCollection,
+  getDefaultSpaceIdForOrg,
+  getNotificationsCollection,
   getOrgInvitesCollection,
   getOrgMembershipsCollection,
   getOrgsCollection,
@@ -21,17 +23,22 @@ import {
   getWpnWorkspacesCollection,
   type UserDoc,
 } from "./db.js";
+import { effectiveRoleInSpace } from "./permission-resolver.js";
 import {
   acceptInviteBody,
   createInviteBody,
   createOrgBody,
   createOrgMemberBody,
+  declineInviteBody,
   resetMemberPasswordBody,
   setActiveOrgBody,
   setMemberRoleBody,
   updateOrgBody,
+  type InviteSpaceGrant,
+  type OrgInviteDoc,
   type OrgRole,
 } from "./org-schemas.js";
+import type { NotificationDoc, OrgInviteNotificationPayload } from "./notification-schemas.js";
 import {
   listMembershipsForUser,
   requireOrgAdminOrMaster,
@@ -54,6 +61,50 @@ function newInviteToken(): { plain: string; hash: string } {
 
 function isValidOrgIdHex(id: string): boolean {
   return /^[a-f0-9]{24}$/i.test(id);
+}
+
+function inviteNotificationDedupeKey(inviteId: string): string {
+  return `org_invite:${inviteId}`;
+}
+
+async function consumeInviteNotification(inviteId: string): Promise<void> {
+  const notifications = getNotificationsCollection();
+  await notifications.updateOne(
+    { dedupeKey: inviteNotificationDedupeKey(inviteId) },
+    { $set: { status: "consumed", consumedAt: new Date() } },
+  );
+}
+
+/**
+ * Phase 8: pick the space the caller lands in when their `activeOrgId` changes.
+ * Prefers a remembered per-org space (still accessible), falls back to the
+ * org's default space — using the read-only lookup so we never silently
+ * enrol the caller as Space Owner. Returns `null` if the org has no default
+ * space (unusual) — the caller then omits `activeSpaceId` from the JWT and
+ * `resolveReadScope` treats the request as "no scope".
+ */
+async function resolveSpaceForOrgEntry(
+  user: UserDoc,
+  orgIdHex: string,
+): Promise<string | null> {
+  const userIdHex = user._id.toHexString();
+  const remembered = user.lastActiveSpaceByOrg?.[orgIdHex];
+  if (remembered && /^[a-f0-9]{24}$/i.test(remembered)) {
+    const direct = await effectiveRoleInSpace(userIdHex, remembered);
+    if (direct) {
+      return remembered;
+    }
+    // Org admins can always enter any space in their org even without a
+    // space-level membership row (mirrors resolveReadScope override).
+    const orgMembership = await getOrgMembershipsCollection().findOne({
+      orgId: orgIdHex,
+      userId: userIdHex,
+    });
+    if (orgMembership?.role === "admin") {
+      return remembered;
+    }
+  }
+  return getDefaultSpaceIdForOrg(orgIdHex);
 }
 
 export function registerOrgRoutes(
@@ -321,7 +372,14 @@ export function registerOrgRoutes(
     return reply.status(204).send();
   });
 
-  /** Switch the access-token's `activeOrgId` claim. Re-issues access token. */
+  /**
+   * Switch the access-token's `activeOrgId` claim. Also resolves a concrete
+   * `activeSpaceId` for the target org — preferring the caller's remembered
+   * space (via `lastActiveSpaceByOrg`) or falling back to the org's default
+   * space — and mints a new access token carrying both claims. Without the
+   * space claim `/wpn/*` reads would resolve to a null scope and return empty
+   * (see Phase 8 note).
+   */
   app.post("/orgs/active", async (request, reply) => {
     const auth = await requireAuth(request, reply, jwtSecret);
     if (!auth) {
@@ -341,16 +399,33 @@ export function registerOrgRoutes(
     if (!ctx) {
       return;
     }
-    await getUsersCollection().updateOne(
-      { _id: new ObjectId(auth.sub) },
-      { $set: { lastActiveOrgId: parsed.data.orgId, lastActiveSpaceId: null } },
-    );
+    const users = getUsersCollection();
+    const user = (await users.findOne({
+      _id: new ObjectId(auth.sub),
+    })) as UserDoc | null;
+    if (!user) {
+      return reply.status(404).send({ error: "User not found" });
+    }
+    const nextSpaceId = await resolveSpaceForOrgEntry(user, parsed.data.orgId);
+    const update: Record<string, unknown> = {
+      lastActiveOrgId: parsed.data.orgId,
+      lastActiveSpaceId: nextSpaceId ?? null,
+    };
+    if (nextSpaceId) {
+      update[`lastActiveSpaceByOrg.${parsed.data.orgId}`] = nextSpaceId;
+    }
+    await users.updateOne({ _id: user._id }, { $set: update });
     const token = signAccessToken(jwtSecret, {
       sub: auth.sub,
       email: auth.email,
       activeOrgId: parsed.data.orgId,
+      ...(nextSpaceId ? { activeSpaceId: nextSpaceId } : {}),
     });
-    return reply.send({ token, activeOrgId: parsed.data.orgId });
+    return reply.send({
+      token,
+      activeOrgId: parsed.data.orgId,
+      activeSpaceId: nextSpaceId,
+    });
   });
 
   /** Admin-only: list pending + accepted invites for an Org. */
@@ -379,6 +454,8 @@ export function registerOrgRoutes(
         createdAt: i.createdAt,
         expiresAt: i.expiresAt,
         acceptedAt: i.acceptedAt ?? null,
+        declinedAt: i.declinedAt ?? null,
+        spaceGrants: i.spaceGrants ?? [],
       })),
     });
   });
@@ -399,6 +476,28 @@ export function registerOrgRoutes(
       return reply.status(400).send({ error: parsed.error.flatten() });
     }
     const email = parsed.data.email.toLowerCase();
+    const spaceGrants: InviteSpaceGrant[] = parsed.data.spaceGrants ?? [];
+    for (const grant of spaceGrants) {
+      if (!isValidOrgIdHex(grant.spaceId)) {
+        return reply
+          .status(400)
+          .send({ error: `Invalid space id: ${grant.spaceId}` });
+      }
+    }
+    const spaceDocs = spaceGrants.length
+      ? await getSpacesCollection()
+          .find({ _id: { $in: spaceGrants.map((g) => new ObjectId(g.spaceId)) } })
+          .toArray()
+      : [];
+    // Every requested space must belong to this org — reject cross-org grants.
+    for (const grant of spaceGrants) {
+      const doc = spaceDocs.find((s) => s._id.toHexString() === grant.spaceId);
+      if (!doc || doc.orgId !== orgId) {
+        return reply
+          .status(400)
+          .send({ error: `Space ${grant.spaceId} does not belong to this org` });
+      }
+    }
     const invites = getOrgInvitesCollection();
     const existingPending = await invites.findOne({
       orgId,
@@ -410,6 +509,7 @@ export function registerOrgRoutes(
     }
     const { plain, hash } = newInviteToken();
     const now = new Date();
+    const expiresAt = new Date(now.getTime() + INVITE_TTL_MS);
     const ins = await invites.insertOne({
       orgId,
       email,
@@ -418,22 +518,70 @@ export function registerOrgRoutes(
       status: "pending",
       invitedByUserId: auth.sub,
       createdAt: now,
-      expiresAt: new Date(now.getTime() + INVITE_TTL_MS),
+      expiresAt,
+      spaceGrants,
     } as never);
+    const inviteIdHex = ins.insertedId.toHexString();
     await recordAudit({
       orgId,
       actorUserId: auth.sub,
       action: "org.invite.create",
       targetType: "org_invite",
-      targetId: ins.insertedId.toHexString(),
-      metadata: { email, role: parsed.data.role },
+      targetId: inviteIdHex,
+      metadata: { email, role: parsed.data.role, spaceGrants: spaceGrants.length },
     });
+
+    // Phase 8: if invitee already has an account, surface the invite as an
+    // in-app notification. New users discover the invite via the token link
+    // (copy/email out-of-band by the admin).
+    const existingUser = (await getUsersCollection().findOne({ email })) as UserDoc | null;
+    if (existingUser) {
+      const org = await getOrgsCollection().findOne({ _id: new ObjectId(orgId) });
+      const inviter = (await getUsersCollection().findOne({
+        _id: new ObjectId(auth.sub),
+      })) as UserDoc | null;
+      const spaceNameById = new Map(spaceDocs.map((s) => [s._id.toHexString(), s.name]));
+      const payload: OrgInviteNotificationPayload = {
+        inviteId: inviteIdHex,
+        orgId,
+        orgName: org?.name ?? "(unknown org)",
+        inviterUserId: auth.sub,
+        inviterDisplayName:
+          inviter?.displayName ?? inviter?.email ?? "(someone)",
+        inviterEmail: inviter?.email ?? "",
+        role: parsed.data.role,
+        spaceGrants: spaceGrants.map((g) => ({
+          spaceId: g.spaceId,
+          spaceName: spaceNameById.get(g.spaceId) ?? "(unknown space)",
+          role: g.role,
+        })),
+        expiresAt: expiresAt.toISOString(),
+      };
+      const notifications = getNotificationsCollection();
+      await notifications.updateOne(
+        { dedupeKey: inviteNotificationDedupeKey(inviteIdHex) },
+        {
+          $setOnInsert: {
+            userId: existingUser._id.toHexString(),
+            type: "org_invite",
+            payload,
+            link: `/invite/${plain}`,
+            status: "unread",
+            createdAt: now,
+            dedupeKey: inviteNotificationDedupeKey(inviteIdHex),
+          } satisfies Omit<NotificationDoc, "_id">,
+        },
+        { upsert: true },
+      );
+    }
+
     return reply.send({
-      inviteId: ins.insertedId.toHexString(),
+      inviteId: inviteIdHex,
       email,
       role: parsed.data.role,
       token: plain,
-      expiresAt: new Date(now.getTime() + INVITE_TTL_MS),
+      expiresAt,
+      spaceGrants,
     });
   });
 
@@ -464,6 +612,7 @@ export function registerOrgRoutes(
     if (result.matchedCount === 0) {
       return reply.status(404).send({ error: "Invite not found or already settled" });
     }
+    await consumeInviteNotification(inviteId);
     await recordAudit({
       orgId,
       actorUserId: auth.sub,
@@ -478,6 +627,9 @@ export function registerOrgRoutes(
    * Public (no auth required): accept an invite token. If the user already
    * exists, simply add membership. Otherwise create the account and require
    * a password in the body. Returns access + refresh tokens.
+   *
+   * Phase 8: inserts `space_memberships` rows per `invite.spaceGrants`, and
+   * marks the matching `notifications` row consumed.
    */
   app.post("/auth/accept-invite", async (request, reply) => {
     const parsed = acceptInviteBody.safeParse(request.body);
@@ -486,12 +638,13 @@ export function registerOrgRoutes(
     }
     const tokenHash = hashInviteToken(parsed.data.token);
     const invites = getOrgInvitesCollection();
-    const invite = await invites.findOne({ tokenHash, status: "pending" });
-    if (!invite || invite.expiresAt.getTime() < Date.now()) {
+    // Pre-check (so we can return a password-needed hint before mutating).
+    const invitePreview = await invites.findOne({ tokenHash, status: "pending" });
+    if (!invitePreview || invitePreview.expiresAt.getTime() < Date.now()) {
       return reply.status(404).send({ error: "Invite not found or expired" });
     }
     const users = getUsersCollection();
-    const email = invite.email.toLowerCase();
+    const email = invitePreview.email.toLowerCase();
     let user = (await users.findOne({ email })) as UserDoc | null;
     let createdUser = false;
     if (!user) {
@@ -507,7 +660,7 @@ export function registerOrgRoutes(
         passwordHash,
         displayName: parsed.data.displayName ?? null,
         mustSetPassword: false,
-        lockedOrgId: invite.orgId,
+        lockedOrgId: invitePreview.orgId,
       } as Omit<UserDoc, "_id">);
       user = (await users.findOne({ _id: ins.insertedId })) as UserDoc;
       createdUser = true;
@@ -532,6 +685,23 @@ export function registerOrgRoutes(
       user = (await users.findOne({ _id: user._id })) as UserDoc;
     }
     const userIdHex = user._id.toHexString();
+    // Atomic transition pending → accepted. Prevents a concurrent decline or
+    // re-accept from double-writing memberships.
+    const claimed = await invites.findOneAndUpdate(
+      { _id: invitePreview._id, status: "pending" },
+      {
+        $set: {
+          status: "accepted",
+          acceptedAt: new Date(),
+          acceptedByUserId: userIdHex,
+        },
+      },
+      { returnDocument: "after" },
+    );
+    const invite = claimed as OrgInviteDoc | null;
+    if (!invite) {
+      return reply.status(409).send({ error: "Invite is no longer pending" });
+    }
     const memberships = getOrgMembershipsCollection();
     await memberships.updateOne(
       { orgId: invite.orgId, userId: userIdHex },
@@ -545,23 +715,44 @@ export function registerOrgRoutes(
       },
       { upsert: true },
     );
-    await invites.updateOne(
-      { _id: invite._id },
-      {
-        $set: {
-          status: "accepted",
-          acceptedAt: new Date(),
-          acceptedByUserId: userIdHex,
-        },
-      },
-    );
+    // Phase 8: attach the inviter's space grants as direct space_memberships.
+    // Idempotent ($setOnInsert) so a re-accept or overlapping grant doesn't
+    // downgrade an existing role.
+    const grants: InviteSpaceGrant[] = invite.spaceGrants ?? [];
+    if (grants.length > 0) {
+      const spaceMemberships = getSpaceMembershipsCollection();
+      for (const grant of grants) {
+        await spaceMemberships.updateOne(
+          { spaceId: grant.spaceId, userId: userIdHex },
+          {
+            $setOnInsert: {
+              spaceId: grant.spaceId,
+              userId: userIdHex,
+              role: grant.role,
+              addedByUserId: invite.invitedByUserId,
+              joinedAt: new Date(),
+            },
+          },
+          { upsert: true },
+        );
+        await recordAudit({
+          orgId: invite.orgId,
+          actorUserId: userIdHex,
+          action: "space.member.add",
+          targetType: "space_membership",
+          targetId: grant.spaceId,
+          metadata: { userId: userIdHex, role: grant.role, viaInvite: invite._id.toHexString() },
+        });
+      }
+    }
+    await consumeInviteNotification(invite._id.toHexString());
     await recordAudit({
       orgId: invite.orgId,
       actorUserId: userIdHex,
       action: "org.invite.accept",
       targetType: "org_invite",
       targetId: invite._id.toHexString(),
-      metadata: { email, role: invite.role },
+      metadata: { email, role: invite.role, spaceGrants: grants.length },
     });
     if (createdUser || !user.defaultOrgId) {
       await users.updateOne(
@@ -569,7 +760,41 @@ export function registerOrgRoutes(
         { $set: { defaultOrgId: invite.orgId } },
       );
     }
-    const payload = { sub: userIdHex, email, activeOrgId: invite.orgId };
+    // Land the invitee in a space they can actually read. If the invite
+    // granted any spaces, pick one of those (preferring the org's default
+    // when it's among the grants, so admins who grant default + extras don't
+    // land the invitee on an arbitrary non-default space). Otherwise fall
+    // back to the org's default — a useful pointer even though the invitee
+    // won't have space-membership there, because the client exposes a
+    // SpaceSwitcher that will let them pick a readable space.
+    //
+    // Previous behavior (always `getDefaultSpaceIdForOrg`) stranded invitees
+    // on a space they had no access to, so the first `/wpn/*` read returned
+    // an empty tree even though they had been granted other spaces.
+    const orgDefaultSpaceId = await getDefaultSpaceIdForOrg(invite.orgId);
+    let inviteSpaceId: string | null = null;
+    if (grants.length > 0) {
+      const grantOnDefault = orgDefaultSpaceId
+        ? grants.find((g) => g.spaceId === orgDefaultSpaceId)
+        : undefined;
+      inviteSpaceId = (grantOnDefault ?? grants[0]).spaceId;
+    } else {
+      inviteSpaceId = orgDefaultSpaceId;
+    }
+    const postAcceptUpdate: Record<string, unknown> = {
+      lastActiveOrgId: invite.orgId,
+      lastActiveSpaceId: inviteSpaceId ?? null,
+    };
+    if (inviteSpaceId) {
+      postAcceptUpdate[`lastActiveSpaceByOrg.${invite.orgId}`] = inviteSpaceId;
+    }
+    await users.updateOne({ _id: user._id }, { $set: postAcceptUpdate });
+    const payload = {
+      sub: userIdHex,
+      email,
+      activeOrgId: invite.orgId,
+      ...(inviteSpaceId ? { activeSpaceId: inviteSpaceId } : {}),
+    };
     const jti = randomUUID();
     const token = signAccessToken(jwtSecret, payload);
     const refreshToken = signRefreshToken(
@@ -589,7 +814,40 @@ export function registerOrgRoutes(
       orgId: invite.orgId,
       role: invite.role,
       createdUser,
+      spaceGrants: grants,
     });
+  });
+
+  /**
+   * Public (no auth): decline an invite token. Idempotent — unknown or
+   * already-settled tokens return 404 uniformly (no leakage).
+   */
+  app.post("/auth/decline-invite", async (request, reply) => {
+    const parsed = declineInviteBody.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.flatten() });
+    }
+    const tokenHash = hashInviteToken(parsed.data.token);
+    const invites = getOrgInvitesCollection();
+    const claimed = await invites.findOneAndUpdate(
+      { tokenHash, status: "pending" },
+      { $set: { status: "declined", declinedAt: new Date() } },
+      { returnDocument: "after" },
+    );
+    const invite = claimed as OrgInviteDoc | null;
+    if (!invite) {
+      return reply.status(404).send({ error: "Invite not found or already settled" });
+    }
+    await consumeInviteNotification(invite._id.toHexString());
+    await recordAudit({
+      orgId: invite.orgId,
+      actorUserId: invite.invitedByUserId,
+      action: "org.invite.decline",
+      targetType: "org_invite",
+      targetId: invite._id.toHexString(),
+      metadata: { email: invite.email },
+    });
+    return reply.send({ ok: true });
   });
 
   /** Admin-only: list members of an Org. */
@@ -877,6 +1135,16 @@ export function registerOrgRoutes(
     const user = (await getUsersCollection().findOne({
       email: invite.email,
     })) as UserDoc | null;
+    const inviter = (await getUsersCollection().findOne({
+      _id: new ObjectId(invite.invitedByUserId),
+    })) as UserDoc | null;
+    const grants = invite.spaceGrants ?? [];
+    const spaceDocs = grants.length
+      ? await getSpacesCollection()
+          .find({ _id: { $in: grants.map((g) => new ObjectId(g.spaceId)) } })
+          .toArray()
+      : [];
+    const spaceNameById = new Map(spaceDocs.map((s) => [s._id.toHexString(), s.name]));
     return reply.send({
       orgId: invite.orgId,
       orgName: org?.name ?? "(unknown org)",
@@ -885,6 +1153,16 @@ export function registerOrgRoutes(
       role: invite.role,
       needsPassword: !user || user.mustSetPassword === true,
       expiresAt: invite.expiresAt,
+      inviter: {
+        userId: invite.invitedByUserId,
+        displayName: inviter?.displayName ?? inviter?.email ?? "(someone)",
+        email: inviter?.email ?? "",
+      },
+      spaceGrants: grants.map((g) => ({
+        spaceId: g.spaceId,
+        spaceName: spaceNameById.get(g.spaceId) ?? "(unknown space)",
+        role: g.role,
+      })),
     });
   });
 }

@@ -983,11 +983,12 @@ export function ChromeOnlyWorkbench(): React.ReactElement {
                   const railActive = Boolean(
                     activeTab?.tabTypeId && it.tabTypeId && it.tabTypeId === activeTab.tabTypeId,
                   );
+                  const Badge = it.BadgeOverlay;
                   return (
                     <button
                       key={it.id}
                       type="button"
-                      className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-md border text-[12px] ${
+                      className={`relative flex h-9 w-9 shrink-0 items-center justify-center rounded-md border text-[12px] ${
                         railActive
                           ? "border-border bg-muted/50 text-foreground"
                           : "border-transparent text-muted-foreground hover:border-border hover:bg-muted/30"
@@ -996,6 +997,7 @@ export function ChromeOnlyWorkbench(): React.ReactElement {
                       onClick={() => openFromRailItem(it)}
                     >
                       {it.icon ?? "•"}
+                      {Badge ? <Badge /> : null}
                     </button>
                   );
                 })}

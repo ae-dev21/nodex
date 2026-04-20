@@ -22,6 +22,7 @@ import {
   cloudRegisterThunk,
   cloudRestoreSessionThunk,
 } from "../store/cloudAuthSlice";
+import { fetchNotificationsThunk } from "../store/notificationsSlice";
 import { consumePostAuthRedirectAfterSignIn } from "./post-auth-redirect";
 
 const LOCAL_AUTH_USER: AuthUser = {
@@ -145,6 +146,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }): React
         if (cloudRestoreSessionThunk.fulfilled.match(result) && result.payload) {
           const { userId, email } = result.payload;
           setState({ status: "authed", user: authUserFromSyncCredentials(userId, email) });
+          void store.dispatch(fetchNotificationsThunk());
           return;
         }
       } catch {

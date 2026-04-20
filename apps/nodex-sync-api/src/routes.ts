@@ -14,7 +14,9 @@ import {
   ensureDefaultSpaceForOrg,
   ensureUserHasDefaultOrg,
   getActiveDb,
+  getDefaultSpaceIdForOrg,
   getNotesCollection,
+  getSpacesCollection,
   getUsersCollection,
 } from "./db.js";
 import { registerBuiltinPluginRoutes } from "./builtin-plugin-routes.js";
@@ -30,6 +32,7 @@ import { registerWpnBatchRoutes } from "./wpn-batch-routes.js";
 import { registerWpnReadRoutes } from "./wpn-routes.js";
 import { registerWpnWriteRoutes } from "./wpn-write-routes.js";
 import { registerMcpDeviceAuthRoutes } from "./mcp-device-auth-routes.js";
+import { registerNotificationsRoutes } from "./notifications-routes.js";
 import { registerWpnImportExportRoutes } from "./wpn-import-export-routes.js";
 import { registerMasterAdminRoutes } from "./master-admin-routes.js";
 import { maybePromoteMasterAdmin } from "./admin-auth.js";
@@ -70,6 +73,49 @@ const syncPushBody = z.object({
     .max(500),
 });
 
+/**
+ * Phase 8: resolve the space to stamp into the session's access token, given
+ * the user doc, the org the session is entering, and a caller-provided
+ * fallback (typically `getDefaultSpaceIdForOrg`). Preference order:
+ *   1. `lastActiveSpaceByOrg[orgId]` (still belongs to that org)
+ *   2. `lastActiveSpaceId` (still belongs to that org)
+ *   3. caller-provided `fallbackSpaceIdHex` (read-only default-space lookup)
+ *
+ * Guards against schema drift where `lastActiveSpaceId` was set before the
+ * user switched orgs — we must not stamp a spaceId that belongs to a
+ * different org onto the new session, or WPN reads will scope incorrectly.
+ */
+async function resolveSessionSpaceId(
+  user: UserDoc,
+  orgIdHex: string,
+  fallbackSpaceIdHex: string,
+): Promise<string> {
+  const candidates: string[] = [];
+  const remembered = user.lastActiveSpaceByOrg?.[orgIdHex];
+  if (typeof remembered === "string" && /^[a-f0-9]{24}$/i.test(remembered)) {
+    candidates.push(remembered);
+  }
+  if (
+    typeof user.lastActiveSpaceId === "string" &&
+    /^[a-f0-9]{24}$/i.test(user.lastActiveSpaceId)
+  ) {
+    candidates.push(user.lastActiveSpaceId);
+  }
+  for (const spaceIdHex of candidates) {
+    try {
+      const space = await getSpacesCollection().findOne({
+        _id: new ObjectId(spaceIdHex),
+      });
+      if (space && space.orgId === orgIdHex) {
+        return spaceIdHex;
+      }
+    } catch {
+      // fall through to next candidate
+    }
+  }
+  return fallbackSpaceIdHex;
+}
+
 export function registerRoutes(
   app: FastifyInstance,
   opts: { jwtSecret: string },
@@ -90,6 +136,7 @@ export function registerRoutes(
   registerAnnouncementRoutes(app, { jwtSecret });
   registerAdminRoutes(app, { jwtSecret });
   registerMasterAdminRoutes(app, { jwtSecret });
+  registerNotificationsRoutes(app, { jwtSecret });
   app.register(
     async (scoped) => registerWpnImportExportRoutes(scoped, { jwtSecret }),
   );
@@ -174,10 +221,19 @@ export function registerRoutes(
         ? userDoc.lastActiveOrgId
         : null;
     const loginActiveOrgId = lastActiveOrgId ?? defaultOrgId;
-    const loginActiveSpaceId =
-      typeof userDoc.lastActiveSpaceId === "string" && userDoc.lastActiveSpaceId.length > 0
-        ? userDoc.lastActiveSpaceId
-        : defaultSpaceId;
+    // If the session is re-entering a non-default org, `lastActiveSpaceId`
+    // may no longer belong to it. resolveSessionSpaceId validates against
+    // the spaces collection and falls back to the target org's default space
+    // (read-only lookup — no silent space-owner enrolment for invited members).
+    const fallbackSpaceId =
+      loginActiveOrgId === defaultOrgId
+        ? defaultSpaceId
+        : (await getDefaultSpaceIdForOrg(loginActiveOrgId)) ?? defaultSpaceId;
+    const loginActiveSpaceId = await resolveSessionSpaceId(
+      userDoc,
+      loginActiveOrgId,
+      fallbackSpaceId,
+    );
     const payload = {
       sub: userId,
       email: user.email,
@@ -243,17 +299,23 @@ export function registerRoutes(
         (typeof user.defaultOrgId === "string" && user.defaultOrgId.length > 0
           ? user.defaultOrgId
           : undefined);
-      let refreshedActiveSpaceId: string | undefined =
-        typeof user.lastActiveSpaceId === "string" && user.lastActiveSpaceId.length > 0
-          ? user.lastActiveSpaceId
-          : undefined;
-      if (!refreshedActiveSpaceId && refreshedActiveOrgId) {
-        const { spaceId } = await ensureDefaultSpaceForOrg(
-          getActiveDb(),
+      let refreshedActiveSpaceId: string | undefined;
+      if (refreshedActiveOrgId) {
+        // Read-only default-space lookup — avoids silently enrolling the
+        // caller as Space Owner when refreshing into an invited org.
+        const fallbackSpaceId =
+          (await getDefaultSpaceIdForOrg(refreshedActiveOrgId)) ?? undefined;
+        const resolved = await resolveSessionSpaceId(
+          user,
           refreshedActiveOrgId,
-          p.sub,
+          fallbackSpaceId ?? "",
         );
-        refreshedActiveSpaceId = spaceId;
+        refreshedActiveSpaceId = resolved.length > 0 ? resolved : undefined;
+      } else if (
+        typeof user.lastActiveSpaceId === "string" &&
+        user.lastActiveSpaceId.length > 0
+      ) {
+        refreshedActiveSpaceId = user.lastActiveSpaceId;
       }
       const token = signAccessToken(
         jwtSecret,

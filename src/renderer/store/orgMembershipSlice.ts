@@ -1,6 +1,11 @@
 import { createAsyncThunk, createSlice, type PayloadAction } from "@reduxjs/toolkit";
+import type { NodexPlatformDeps } from "@nodex/platform";
 import { createOrg, listMyOrgs, setActiveOrgRemote } from "../auth/auth-client";
 import { setActiveOrgId, type AuthUserOrg } from "../auth/auth-session";
+import { setLocalActiveSpace, loadOrgSpacesThunk } from "./spaceMembershipSlice";
+import { resetCloudNotes, runCloudSyncThunk } from "./cloudNotesSlice";
+
+type OrgMembershipThunkExtra = { extra: NodexPlatformDeps };
 
 const STALE_AFTER_MS = 60_000;
 
@@ -31,13 +36,27 @@ export const loadMyOrgsThunk = createAsyncThunk(
 );
 
 export const switchActiveOrgThunk = createAsyncThunk<
-  { activeOrgId: string },
-  { orgId: string }
+  { activeOrgId: string; activeSpaceId: string | null },
+  { orgId: string },
+  OrgMembershipThunkExtra
 >(
   "orgMembership/switch",
-  async ({ orgId }) => {
-    await setActiveOrgRemote(orgId);
-    return { activeOrgId: orgId };
+  async ({ orgId }, { dispatch }) => {
+    const r = await setActiveOrgRemote(orgId);
+    // Propagate the new space claim into Redux so WpnExplorer's
+    // useEffect([activeSpaceId]) refires and loads the new org's tree.
+    if (r.activeSpaceId) {
+      dispatch(setLocalActiveSpace({ spaceId: r.activeSpaceId }));
+    } else {
+      // Edge case: server couldn't resolve a default space for this org.
+      // Rehydrate the space list so the default can be picked client-side.
+      void dispatch(loadOrgSpacesThunk({ orgId }));
+    }
+    // Drop the previous scope's cloud-notes bucket and resync under the new
+    // scope headers so the flat cloud-notes plugin doesn't leak across orgs.
+    dispatch(resetCloudNotes());
+    void dispatch(runCloudSyncThunk());
+    return { activeOrgId: r.activeOrgId, activeSpaceId: r.activeSpaceId };
   },
 );
 

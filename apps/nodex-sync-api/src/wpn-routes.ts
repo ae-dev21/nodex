@@ -5,6 +5,7 @@ import type { WpnNoteDoc, WpnProjectDoc, WpnWorkspaceDoc } from "./db.js";
 import {
   ensureDefaultSpaceForOrg,
   getActiveDb,
+  getDefaultSpaceIdForOrg,
   getOrgMembershipsCollection,
   getProjectSharesCollection,
   getSpacesCollection,
@@ -152,6 +153,22 @@ async function resolveReadScope(
       auth.sub,
     );
     spaceId = fallback;
+  }
+  // Phase 8 safety net: if the caller has an `activeOrgId` claim but no
+  // `activeSpaceId` (e.g. a token minted before this fix shipped, or a future
+  // flow that forgets to set the claim), fall back to the org's default space
+  // as long as the caller is actually a member of that org. Without this the
+  // /wpn/* endpoints silently return an empty tree and the user is stuck.
+  // Read-only lookup — the access-check below (`effectiveRoleInSpace` / org-
+  // admin override) decides whether the caller can actually read that space.
+  if (!spaceId && typeof auth.activeOrgId === "string" && auth.activeOrgId.length > 0) {
+    const orgMembership = await getOrgMembershipsCollection().findOne({
+      orgId: auth.activeOrgId,
+      userId: auth.sub,
+    });
+    if (orgMembership) {
+      spaceId = await getDefaultSpaceIdForOrg(auth.activeOrgId);
+    }
   }
   if (!spaceId) {
     return null;

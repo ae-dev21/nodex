@@ -11,7 +11,10 @@ import {
   type OrgRole,
   type SpaceRole,
 } from "./auth-session";
-import { writeCloudSyncToken } from "../cloud-sync/cloud-sync-storage";
+import {
+  writeCloudSyncRefreshToken,
+  writeCloudSyncToken,
+} from "../cloud-sync/cloud-sync-storage";
 
 type AuthResponse = { token: string; user: AuthUser };
 
@@ -44,11 +47,16 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   if (spaceId) {
     scopeHeaders["X-Nodex-Space"] = spaceId;
   }
+  // Fastify rejects bodies declared as application/json when empty
+  // (FST_ERR_CTP_EMPTY_JSON_BODY), so only set the content-type when we are
+  // actually sending a body.
+  const bodyHeaders: Record<string, string> =
+    init?.body != null ? { "Content-Type": "application/json" } : {};
   const res = await fetch(`/api/v1${path}`, {
     credentials: "include",
     ...(init ?? {}),
     headers: {
-      "Content-Type": "application/json",
+      ...bodyHeaders,
       ...scopeHeaders,
       ...(init?.headers ?? {}),
     },
@@ -166,24 +174,41 @@ export async function listMyOrgs(): Promise<ListOrgsResponse> {
   return r;
 }
 
-export async function setActiveOrgRemote(orgId: string): Promise<{ token: string }> {
+export async function setActiveOrgRemote(orgId: string): Promise<{
+  token: string;
+  activeOrgId: string;
+  activeSpaceId: string | null;
+}> {
   const token = getAccessToken();
   if (!token) {
     throw new Error("Unauthorized");
   }
-  const r = await requestJson<{ token: string; activeOrgId: string }>(
-    "/orgs/active",
-    {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ orgId }),
-    },
-  );
+  const r = await requestJson<{
+    token: string;
+    activeOrgId: string;
+    activeSpaceId: string | null;
+  }>("/orgs/active", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ orgId }),
+  });
   setAccessToken(r.token);
   writeCloudSyncToken(r.token);
   setActiveOrgId(r.activeOrgId);
-  return { token: r.token };
+  // The server's JWT carries both activeOrgId and activeSpaceId; without this
+  // mirror write, WpnExplorer's useEffect([activeSpaceId]) won't refire on org
+  // switch and the tree goes stale.
+  if (r.activeSpaceId) {
+    setActiveSpaceId(r.activeSpaceId);
+  }
+  return { token: r.token, activeOrgId: r.activeOrgId, activeSpaceId: r.activeSpaceId };
 }
+
+export type InviteSpaceGrantInfo = {
+  spaceId: string;
+  spaceName: string;
+  role: SpaceRole;
+};
 
 export type OrgInvitePreview = {
   orgId: string;
@@ -193,6 +218,12 @@ export type OrgInvitePreview = {
   role: OrgRole;
   needsPassword: boolean;
   expiresAt: string;
+  inviter: {
+    userId: string;
+    displayName: string;
+    email: string;
+  };
+  spaceGrants: InviteSpaceGrantInfo[];
 };
 
 export async function previewInvite(token: string): Promise<OrgInvitePreview> {
@@ -213,6 +244,7 @@ export async function acceptInvite(payload: {
   orgId: string;
   role: OrgRole;
   createdUser: boolean;
+  spaceGrants: { spaceId: string; role: SpaceRole }[];
 }> {
   const r = await requestJson<{
     token: string;
@@ -221,13 +253,29 @@ export async function acceptInvite(payload: {
     orgId: string;
     role: OrgRole;
     createdUser: boolean;
+    spaceGrants?: { spaceId: string; role: SpaceRole }[];
   }>("/auth/accept-invite", {
     method: "POST",
     body: JSON.stringify(payload),
   });
   setAccessToken(r.token);
   setActiveOrgId(r.orgId);
-  return r;
+  // Persist to localStorage so the post-accept `window.location.reload()` in
+  // App.tsx restores the new (invited-org-scoped) session. Without this,
+  // cloudRestoreSessionThunk reads the caller's pre-accept token and rehydrates
+  // the UI in the wrong org — the tree appears to "always show the inviter's
+  // own notes" regardless of which org is selected.
+  writeCloudSyncToken(r.token);
+  writeCloudSyncRefreshToken(r.refreshToken);
+  return { ...r, spaceGrants: r.spaceGrants ?? [] };
+}
+
+/** Decline an invite by token. Idempotent; unknown tokens return 404. */
+export async function declineInvite(token: string): Promise<void> {
+  await requestJson<{ ok: true }>("/auth/decline-invite", {
+    method: "POST",
+    body: JSON.stringify({ token }),
+  });
 }
 
 export type OrgMember = {
@@ -254,15 +302,24 @@ export async function listOrgMembers(orgId: string): Promise<OrgMember[]> {
   return r.members;
 }
 
+export type OrgInviteStatus =
+  | "pending"
+  | "accepted"
+  | "revoked"
+  | "declined"
+  | "expired";
+
 export type OrgInviteRow = {
   inviteId: string;
   email: string;
   role: OrgRole;
-  status: "pending" | "accepted" | "revoked";
+  status: OrgInviteStatus;
   invitedByUserId: string;
   createdAt: string;
   expiresAt: string;
   acceptedAt: string | null;
+  declinedAt: string | null;
+  spaceGrants: { spaceId: string; role: SpaceRole }[];
 };
 
 export async function listOrgInvites(orgId: string): Promise<OrgInviteRow[]> {
@@ -284,12 +341,14 @@ export async function createOrgInvite(payload: {
   orgId: string;
   email: string;
   role?: OrgRole;
+  spaceGrants?: { spaceId: string; role: SpaceRole }[];
 }): Promise<{
   inviteId: string;
   email: string;
   role: OrgRole;
   token: string;
   expiresAt: string;
+  spaceGrants: { spaceId: string; role: SpaceRole }[];
 }> {
   const token = getAccessToken();
   if (!token) {
@@ -298,7 +357,13 @@ export async function createOrgInvite(payload: {
   return requestJson(`/orgs/${encodeURIComponent(payload.orgId)}/invites`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ email: payload.email, role: payload.role ?? "member" }),
+    body: JSON.stringify({
+      email: payload.email,
+      role: payload.role ?? "member",
+      ...(payload.spaceGrants && payload.spaceGrants.length > 0
+        ? { spaceGrants: payload.spaceGrants }
+        : {}),
+    }),
   });
 }
 
@@ -1134,5 +1199,89 @@ export async function deleteUser(userId: string): Promise<{
     method: "DELETE",
     headers: masterHeaders(),
   });
+}
+
+// ----- Phase 8: Notifications -----
+
+export type NotificationEntity = {
+  id: string;
+  userId: string;
+  type: "org_invite";
+  payload: Record<string, unknown>;
+  link: string;
+  status: "unread" | "read" | "consumed" | "dismissed";
+  createdAt: string;
+  readAt: string | null;
+  consumedAt: string | null;
+  dismissedAt: string | null;
+};
+
+export type OrgInviteNotificationPayload = {
+  inviteId: string;
+  orgId: string;
+  orgName: string;
+  inviterUserId: string;
+  inviterDisplayName: string;
+  inviterEmail: string;
+  role: OrgRole;
+  spaceGrants: InviteSpaceGrantInfo[];
+  expiresAt: string;
+};
+
+export type ListNotificationsResponse = {
+  notifications: NotificationEntity[];
+  unreadCount: number;
+  cursor: string | null;
+};
+
+export async function listNotifications(params?: {
+  since?: string;
+  unread?: boolean;
+  limit?: number;
+}): Promise<ListNotificationsResponse> {
+  const token = getAccessToken();
+  if (!token) {
+    throw new Error("Unauthorized");
+  }
+  const qs = new URLSearchParams();
+  if (params?.since) qs.set("since", params.since);
+  if (params?.unread) qs.set("unread", "1");
+  if (params?.limit) qs.set("limit", String(params.limit));
+  const tail = qs.toString() ? `?${qs.toString()}` : "";
+  return requestJson<ListNotificationsResponse>(`/me/notifications${tail}`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function markNotificationsRead(
+  ids: string[],
+): Promise<{ updated: number }> {
+  const token = getAccessToken();
+  if (!token) {
+    throw new Error("Unauthorized");
+  }
+  if (ids.length === 0) {
+    return { updated: 0 };
+  }
+  return requestJson<{ updated: number }>("/me/notifications/read", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ ids }),
+  });
+}
+
+export async function dismissNotification(id: string): Promise<void> {
+  const token = getAccessToken();
+  if (!token) {
+    throw new Error("Unauthorized");
+  }
+  await requestJson<{ ok: true }>(
+    `/me/notifications/${encodeURIComponent(id)}/dismiss`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    },
+  );
 }
 

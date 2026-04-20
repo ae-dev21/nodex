@@ -1,3 +1,4 @@
+import type React from "react";
 import type { ShellRegionId } from "../views/ShellViewRegistry";
 
 export type ShellMenuRailItem = {
@@ -6,6 +7,12 @@ export type ShellMenuRailItem = {
   order?: number;
   /** Optional icon (emoji/string); real icons can come later. */
   icon?: string;
+  /**
+   * Optional React component rendered as a small overlay on the rail button
+   * (e.g. unread-count badge). Returning `null` renders nothing. The component
+   * manages its own reactivity (e.g. via Redux selectors).
+   */
+  BadgeOverlay?: React.ComponentType;
   /**
    * Runs a custom handler (palette, complex flows). If set, takes precedence over
    * {@link tabTypeId} / {@link openViewId}.

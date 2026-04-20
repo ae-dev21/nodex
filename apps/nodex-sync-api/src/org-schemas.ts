@@ -196,6 +196,7 @@ export type AuditAction =
   | "org.invite.create"
   | "org.invite.revoke"
   | "org.invite.accept"
+  | "org.invite.decline"
   | "space.create"
   | "space.delete"
   | "space.rename"
@@ -251,7 +252,17 @@ export type OrgMembershipDoc = {
   joinedAt: Date;
 };
 
-export type OrgInviteStatus = "pending" | "accepted" | "revoked";
+export type OrgInviteStatus =
+  | "pending"
+  | "accepted"
+  | "revoked"
+  | "declined"
+  | "expired";
+
+export type InviteSpaceGrant = {
+  spaceId: string;
+  role: SpaceRole;
+};
 
 export type OrgInviteDoc = {
   _id: ObjectId;
@@ -265,6 +276,10 @@ export type OrgInviteDoc = {
   expiresAt: Date;
   acceptedAt?: Date;
   acceptedByUserId?: string;
+  declinedAt?: Date;
+  declinedByUserId?: string;
+  /** Phase 8: spaces to auto-join on accept, with per-space role. */
+  spaceGrants?: InviteSpaceGrant[];
 };
 
 export type MigrationDoc = {
@@ -295,10 +310,22 @@ export const updateOrgBody = z.object({
 
 export const orgRoleSchema = z.enum(["admin", "member"]);
 
+export const inviteSpaceGrantSchema = z.object({
+  spaceId: z.string().min(1),
+  role: spaceRoleSchema,
+});
+
 export const createInviteBody = z.object({
   email: z.string().email(),
   role: orgRoleSchema.default("member"),
+  spaceGrants: z.array(inviteSpaceGrantSchema).max(50).optional(),
 });
+
+export const declineInviteBody = z
+  .object({
+    token: z.string().min(10),
+  })
+  .strict();
 
 export const acceptInviteBody = z
   .object({
@@ -331,3 +358,5 @@ export const resetMemberPasswordBody = z.object({
 export type CreateOrgInput = z.infer<typeof createOrgBody>;
 export type CreateInviteInput = z.infer<typeof createInviteBody>;
 export type AcceptInviteInput = z.infer<typeof acceptInviteBody>;
+export type DeclineInviteInput = z.infer<typeof declineInviteBody>;
+export type InviteSpaceGrantInput = z.infer<typeof inviteSpaceGrantSchema>;
